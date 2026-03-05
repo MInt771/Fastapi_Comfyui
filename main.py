@@ -13,6 +13,7 @@ import httpx
 from sqlmodel import Session, select
 
 from db import GenerationRecord, GenerationTask, TaskStatus, engine, init_db
+from llm_prompt import generate_image_prompt, generate_image_prompt_collab
 
 
 COMFYUI_API_BASE = os.getenv("COMFYUI_API_BASE", "http://127.0.0.1:8000")
@@ -23,6 +24,14 @@ class GenerateRequest(BaseModel):
     text: str = Field(..., description="文案内容")
     style: str = Field(..., description="风格描述，例如 二次元插画/电商海报")
     count: int = Field(1, ge=1, le=8, description="需要生成的图片数量（1-8）")
+    use_llm: bool = Field(
+        default=False,
+        description="是否使用 LangChain + 大模型对提示词进行智能优化",
+    )
+    llm_name: Optional[str] = Field(
+        default=None,
+        description="可选：指定在 llm_config.json 中配置的模型名称，例如 deepseek/qwen",
+    )
 
 
 class GeneratedImage(BaseModel):
@@ -35,6 +44,42 @@ class GenerateResponse(BaseModel):
 
 
 app = FastAPI(title="AI 素材生成工厂 Demo")
+
+
+class PromptPreviewRequest(BaseModel):
+    text: str = Field(..., description="原始中文文案")
+    style: str = Field(..., description="风格描述，例如 二次元插画/电商海报")
+    llm_name: Optional[str] = Field(
+        default=None,
+        description="可选：指定在 llm_config.json 中配置的模型名称，例如 deepseek/qwen",
+    )
+
+
+class PromptCollabRequest(BaseModel):
+    text: str = Field(..., description="原始中文文案")
+    style: str = Field(..., description="风格描述，例如 二次元插画/电商海报")
+    planner_llm_name: Optional[str] = Field(
+        default=None,
+        description="第一阶段生成基础提示词的模型名称（llm_config.json 中的 key）",
+    )
+    reviewer_llm_name: Optional[str] = Field(
+        default=None,
+        description="第二阶段审稿/优化提示词的模型名称（llm_config.json 中的 key，可为空，默认与 planner 相同）",
+    )
+
+
+class GenerateCollabRequest(BaseModel):
+    text: str = Field(..., description="原始中文文案")
+    style: str = Field(..., description="风格描述，例如 二次元插画/电商海报")
+    count: int = Field(1, ge=1, le=8, description="需要生成的图片数量（1-8）")
+    planner_llm_name: Optional[str] = Field(
+        default=None,
+        description="第一阶段生成基础提示词的模型名称（llm_config.json 中的 key）",
+    )
+    reviewer_llm_name: Optional[str] = Field(
+        default=None,
+        description="第二阶段审稿/优化提示词的模型名称（llm_config.json 中的 key，可为空，默认与 planner 相同）",
+    )
 
 """
 1. 初始化数据库
@@ -74,15 +119,38 @@ async def _worker_loop() -> None:
                 session.commit()
                 session.refresh(task)
 
-            prompt_text = f"{task.style}, {task.text}".strip(", ")
-            start_ts = time.perf_counter()
-
+            # 1) 根据任务配置决定提示词来源：直接拼接 / 单模型 LLM / 多模型协同
             try:
+                if getattr(task, "use_collab", False):
+                    collab_result = await generate_image_prompt_collab(
+                        text=task.text,
+                        style=task.style,
+                        planner_llm_name=getattr(task, "planner_llm_name", None),
+                        reviewer_llm_name=getattr(task, "reviewer_llm_name", None),
+                    )
+                    prompt_text = collab_result.get("final_prompt") or collab_result.get(
+                        "base_prompt"
+                    )
+                    if not prompt_text:
+                        raise RuntimeError("协同模式下未生成有效提示词")
+                elif getattr(task, "use_llm", False):
+                    prompt_text = await generate_image_prompt(
+                        text=task.text,
+                        style=task.style,
+                        llm_name=getattr(task, "llm_name", None),
+                    )
+                else:
+                    prompt_text = f"{task.style}, {task.text}".strip(", ")
+
+                start_ts = time.perf_counter()
+
+                # 2) 调用 ComfyUI 出图
                 workflow = _load_workflow_template()
                 workflow = _inject_prompt_into_workflow(workflow, prompt_text, task.count)
                 results = await _call_comfyui(workflow, task.count)
                 duration_ms = int((time.perf_counter() - start_ts) * 1000)
 
+                # 3) 写入记录与更新任务状态
                 with Session(engine) as session:
                     record = GenerationRecord(
                         text=task.text,
@@ -280,13 +348,48 @@ class CreateTaskRequest(BaseModel):
     text: str = Field(..., description="文案内容")
     style: str = Field(..., description="风格描述")
     count: int = Field(1, ge=1, le=8, description="生成图片数量")
+    use_llm: bool = Field(
+        default=False,
+        description="是否在任务中使用单模型 LLM 提示词优化（等价于 /generate 的 use_llm）",
+    )
+    llm_name: Optional[str] = Field(
+        default=None,
+        description="单模型模式下使用的 llm 名称（llm_config.json 中的 key）",
+    )
+    use_collab: bool = Field(
+        default=False,
+        description="是否在任务中使用多模型协同提示词（等价于 /generate_collab 的逻辑）",
+    )
+    planner_llm_name: Optional[str] = Field(
+        default=None,
+        description="协同模式下第一阶段模型名称",
+    )
+    reviewer_llm_name: Optional[str] = Field(
+        default=None,
+        description="协同模式下第二阶段模型名称，默认与 planner 相同",
+    )
 
 
 @app.post("/tasks")
 def create_task(req: CreateTaskRequest):
-    """创建异步任务，立即返回 task_id。后台 worker 会排队执行。"""
+    """创建异步任务，立即返回 task_id。后台 worker 会排队执行。
+
+    支持三种模式：
+    - 纯 ComfyUI：use_llm/use_collab 均为 false（默认）；
+    - 单模型 LLM 提示词优化：use_llm=true；
+    - 多模型协同：use_collab=true（优先级高于 use_llm）。
+    """
     with Session(engine) as session:
-        task = GenerationTask(text=req.text, style=req.style, count=req.count)
+        task = GenerationTask(
+            text=req.text,
+            style=req.style,
+            count=req.count,
+            use_llm=req.use_llm,
+            llm_name=req.llm_name,
+            use_collab=req.use_collab,
+            planner_llm_name=req.planner_llm_name,
+            reviewer_llm_name=req.reviewer_llm_name,
+        )
         session.add(task)
         session.commit()
         session.refresh(task)
@@ -363,9 +466,26 @@ def list_tasks(limit: int = 20, status: Optional[str] = None):
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest):
     """
-    接收文案 text 和风格 style，组合成 prompt，调用 ComfyUI 生成一张图片。
+    接收文案 text 和风格 style，组合成 prompt，调用 ComfyUI 生成图片。
+    当 use_llm=true 时，会先通过 LangChain + 大模型对提示词进行优化，再注入工作流。
     """
+    # 默认直接拼接风格 + 文案
     prompt_text = f"{req.style}, {req.text}".strip(", ")
+
+    if req.use_llm:
+        try:
+            # 利用 LangChain + LLM 生成更细致的英文提示词
+            optimized = await generate_image_prompt(
+                text=req.text, style=req.style, llm_name=req.llm_name
+            )
+            if optimized:
+                prompt_text = optimized
+        except Exception as e:
+            # 为了健壮性，LLM 失败时退回到简单拼接模式，而不是直接报错
+            raise HTTPException(
+                status_code=500,
+                detail=f"使用 LLM 优化提示词失败: {e}",
+            )
     start_ts = time.perf_counter()
 
     try:
@@ -390,6 +510,115 @@ async def generate(req: GenerateRequest):
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成失败: {e}")
+
+    images = [
+        GeneratedImage(image_url=url, md5=md5) for url, md5 in results
+    ]
+    return JSONResponse(content={"images": [img.model_dump() for img in images]})
+
+
+@app.post("/llm/prompt_preview")
+async def llm_prompt_preview(req: PromptPreviewRequest):
+    """
+    仅调用 LangChain + LLM，返回优化后的英文提示词，不触发 ComfyUI。
+    可用于运营/算法同学在线调试 Prompt、对比不同版本的效果。
+    """
+    try:
+        optimized = await generate_image_prompt(
+            text=req.text, style=req.style, llm_name=req.llm_name
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"生成优化提示词失败: {e}")
+
+    return {
+        "text": req.text,
+        "style": req.style,
+        "optimized_prompt": optimized,
+    }
+
+
+@app.post("/llm/prompt_collab")
+async def llm_prompt_collab(req: PromptCollabRequest):
+    """
+    多模型协同生成提示词：
+    - planner_llm 负责从文案+风格生成基础英文提示词；
+    - reviewer_llm 负责在基础提示词上做审稿和强化。
+
+    适合在 JD 场景下展示“多大模型协同工作流编排”的能力。
+    """
+    try:
+        result = await generate_image_prompt_collab(
+            text=req.text,
+            style=req.style,
+            planner_llm_name=req.planner_llm_name,
+            reviewer_llm_name=req.reviewer_llm_name,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"多模型协同生成提示词失败: {e}"
+        )
+
+    return {
+        "text": req.text,
+        "style": req.style,
+        "planner_llm_name": req.planner_llm_name,
+        "reviewer_llm_name": req.reviewer_llm_name or req.planner_llm_name,
+        **result,
+    }
+
+
+@app.post("/generate_collab", response_model=GenerateResponse)
+async def generate_collab(req: GenerateCollabRequest):
+    """
+    多模型协同版生成接口：
+    1. 先调用 generate_image_prompt_collab，使用两个 LLM 协同产出 base_prompt 和 final_prompt；
+    2. 使用 final_prompt 注入 ComfyUI 工作流生成图片；
+    3. 将 final_prompt 写入数据库的 prompt_text 字段，便于后续分析与复盘。
+    """
+    # 第一步：多模型协同生成提示词
+    try:
+        collab_result = await generate_image_prompt_collab(
+            text=req.text,
+            style=req.style,
+            planner_llm_name=req.planner_llm_name,
+            reviewer_llm_name=req.reviewer_llm_name,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"多模型协同生成提示词失败: {e}"
+        )
+
+    final_prompt = collab_result.get("final_prompt") or collab_result.get(
+        "base_prompt"
+    )
+    if not final_prompt:
+        raise HTTPException(status_code=500, detail="协同提示词结果为空")
+
+    start_ts = time.perf_counter()
+
+    # 第二步：调用 ComfyUI 出图
+    try:
+        workflow = _load_workflow_template()
+        workflow = _inject_prompt_into_workflow(workflow, final_prompt, req.count)
+        results = await _call_comfyui(workflow, req.count)
+        duration_ms = int((time.perf_counter() - start_ts) * 1000)
+
+        # 写入数据库（记录最终使用的提示词）
+        with Session(engine) as session:
+            record = GenerationRecord(
+                text=req.text,
+                style=req.style,
+                prompt_text=final_prompt,
+                image_urls=json.dumps([url for url, _ in results], ensure_ascii=False),
+                md5_list=json.dumps([md5 for _, md5 in results]),
+                duration_ms=duration_ms,
+            )
+            session.add(record)
+            session.commit()
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"协同生成图片失败: {e}")
 
     images = [
         GeneratedImage(image_url=url, md5=md5) for url, md5 in results

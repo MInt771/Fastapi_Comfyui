@@ -43,6 +43,13 @@ class GenerationTask(SQLModel, table=True):
     style: str
     count: int
 
+    # LLM 配置：兼容 /generate 的单模型与协同模式
+    use_llm: bool = Field(default=False)
+    llm_name: Optional[str] = None
+    use_collab: bool = Field(default=False)
+    planner_llm_name: Optional[str] = None
+    reviewer_llm_name: Optional[str] = None
+
     status: TaskStatus = Field(default=TaskStatus.PENDING)
     error_message: Optional[str] = None
 
