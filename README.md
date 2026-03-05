@@ -232,11 +232,14 @@ cp llm_config.example.json llm_config.json
 
 ```
 .
-├── main.py                    # FastAPI 应用、接口、ComfyUI 调用、后台 worker
+├── main.py                    # FastAPI 应用、接口、ComfyUI 调用、后台 worker、LLM 集成
 ├── db.py                      # SQLModel 表（GenerationRecord、GenerationTask）
-├── requirements.txt
-├── comfyui_workflow_api.json   # 需自行从 ComfyUI 导出
-├── data.db                    # SQLite（自动创建，已加入 .gitignore）
+├── llm_prompt.py              # 基于 LangChain 的多模型 Prompt 生成与协同逻辑
+├── llm_config.example.json    # LLM 配置示例（可复制为 llm_config.json 后填写真实信息）
+├── llm_config.json            # 本地 LLM 配置（已加入 .gitignore，不会提交到仓库）
+├── comfyui_workflow_api.json  # 从 ComfyUI 导出的工作流（Save (API)）
+├── requirements.txt           # Python 依赖
+├── .gitignore                 # 忽略包含敏感信息的本地文件（如 llm_config.json、data.db 等）
 └── README.md
 ```
 
